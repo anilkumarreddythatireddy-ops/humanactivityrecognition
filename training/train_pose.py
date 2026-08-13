@@ -1,287 +1,363 @@
 """
 =========================================================
-ViTPose Training Script
-Supports:
+Research-Oriented ViT Pose Training
 
-✓ Resume Training
-✓ Best Model Saving
-✓ Last Checkpoint Saving
-✓ Kaggle GPU & Windows CPU/GPU Compatibility
-✓ Mixed Precision Training
-✓ LR Scheduler
-✓ Gradient Clipping
+MPII Human Pose Estimation
 
+Author : Anil
 =========================================================
 """
 
 import os
 import sys
 import time
-from tqdm import tqdm
-
 import torch
 import torch.nn as nn
+
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import torchvision.transforms as transforms
+from torch.utils.data import random_split
 
-# Updated imports for newer PyTorch versions
-from torch.amp import autocast, GradScaler
+# ---------------------------------------------------
+# Add project root
+# ---------------------------------------------------
 
-# -------------------------------------------------------
-# Project Root & Config
-# -------------------------------------------------------
-
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        ".."
+ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
     )
 )
 
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 
-from configs.config import Config
-cfg = Config
+# ---------------------------------------------------
+# Project Imports
+# ---------------------------------------------------
 
-# =========================================================
-# Main Execution Block (Required for Windows DataLoader)
-# =========================================================
+from datasets.mpii_train_dataset import MPIITrainDataset
+from preprocessing.transforms import train_transform
+from models.vit_pose import ViTPose
 
-if __name__ == "__main__":
+# ---------------------------------------------------
+# Configuration
+# ---------------------------------------------------
 
-    # -------------------------------------------------------
-    # Dataset & Transformations
-    # -------------------------------------------------------
-    from datasets.mpii_train_dataset import MPIITrainDataset
+IMAGE_DIR = "datasets/mpii/images"
 
-    # FIXED: ToTensor() must come FIRST to convert the NumPy array 
-    # before applying Resize() and Normalize()
-    train_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((cfg.IMAGE_SIZE, cfg.IMAGE_SIZE), antialias=True),
-        transforms.Normalize(mean=cfg.MEAN, std=cfg.STD)
-    ])
+ANNOTATION_FILE = (
+    "datasets/mpii/annotations/"
+    "mpii_human_pose_v1_u12_1.mat"
+)
 
-    # Pass the transform pipeline into MPIITrainDataset
-    train_dataset = MPIITrainDataset(
-        image_dir=cfg.MPII_IMAGE_DIR,
-        annotation_file=cfg.MPII_ANNOTATION_FILE,
-        transform=train_transform
+CHECKPOINT_DIR = "checkpoints"
+
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+BATCH_SIZE = 8
+EPOCHS = 15
+LEARNING_RATE = 1e-4
+
+TRAIN_SPLIT = 0.80
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+print("=" * 60)
+print("Device :", DEVICE)
+print("=" * 60)
+
+# ---------------------------------------------------
+# Dataset
+# ---------------------------------------------------
+
+dataset = MPIITrainDataset(
+    image_dir=IMAGE_DIR,
+    annotation_file=ANNOTATION_FILE,
+    transform=train_transform
+)
+
+train_size = int(
+    TRAIN_SPLIT * len(dataset)
+)
+
+val_size = len(dataset) - train_size
+
+train_dataset, val_dataset = random_split(
+    dataset,
+    [train_size, val_size],
+    generator=torch.Generator().manual_seed(42)
+)
+
+print("Training Samples :", len(train_dataset))
+print("Validation Samples :", len(val_dataset))
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=False
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=False
+)
+
+# ---------------------------------------------------
+# Model
+# ---------------------------------------------------
+
+model = ViTPose(
+    image_size=256,
+    patch_size=16,
+    embed_dim=256,
+    depth=4,
+    num_heads=8,
+    num_joints=16
+).to(DEVICE)
+
+print("\nModel Loaded Successfully\n")
+
+# ---------------------------------------------------
+# Loss
+# ---------------------------------------------------
+
+criterion = nn.MSELoss()
+
+# ---------------------------------------------------
+# Optimizer
+# ---------------------------------------------------
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=1e-4
+)
+
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=EPOCHS
+)
+
+best_loss = float("inf")
+start_epoch = 0
+# =====================================================
+# Resume Training (Optional)
+# =====================================================
+
+RESUME = False
+
+RESUME_PATH = os.path.join(
+    CHECKPOINT_DIR,
+    "best_model.pth"
+)
+
+if RESUME and os.path.exists(RESUME_PATH):
+
+    checkpoint = torch.load(
+        RESUME_PATH,
+        map_location=DEVICE
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=True,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY and torch.cuda.is_available()
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
     )
 
-    # -------------------------------------------------------
-    # Model
-    # -------------------------------------------------------
-    from models.vit_pose import ViTPose
-
-    DEVICE = cfg.DEVICE
-
-    model = ViTPose(
-        num_joints=cfg.NUM_JOINTS
-    ).to(DEVICE)
-
-    # -------------------------------------------------------
-    # Loss, Optimizer & Scheduler
-    # -------------------------------------------------------
-    criterion = nn.MSELoss()
-
-    optimizer = AdamW(
-        model.parameters(),
-        lr=cfg.LEARNING_RATE,
-        weight_decay=cfg.WEIGHT_DECAY
+    optimizer.load_state_dict(
+        checkpoint["optimizer_state_dict"]
     )
 
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=cfg.POSE_EPOCHS
-    )
+    start_epoch = checkpoint["epoch"]
 
-    # -------------------------------------------------------
-    # Mixed Precision (Automatically disables if on CPU)
-    # -------------------------------------------------------
-    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
-
-    # -------------------------------------------------------
-    # Checkpoint Directory
-    # -------------------------------------------------------
-    os.makedirs(
-        cfg.CHECKPOINT_DIR,
-        exist_ok=True
-    )
-
-    LAST_CHECKPOINT = os.path.join(
-        cfg.CHECKPOINT_DIR,
-        "last_checkpoint.pth"
-    )
-
-    BEST_MODEL = os.path.join(
-        cfg.CHECKPOINT_DIR,
-        "best_model.pth"
-    )
-
-    best_loss = float("inf")
-    start_epoch = 0
+    best_loss = checkpoint["best_loss"]
 
     print("=" * 60)
-    print("Device :", DEVICE)
+    print("Checkpoint Loaded")
+    print("Resuming from Epoch:", start_epoch)
     print("=" * 60)
 
-    # =========================================================
-    # Resume Training Automatically
-    # =========================================================
 
-    if os.path.exists(LAST_CHECKPOINT):
+# =====================================================
+# Training Loop
+# =====================================================
 
-        print("=" * 60)
-        print("Loading Previous Checkpoint...")
-        print("=" * 60)
+for epoch in range(start_epoch, EPOCHS):
 
-        checkpoint = torch.load(
-            LAST_CHECKPOINT,
-            map_location=DEVICE
+    print("\n")
+    print("=" * 70)
+    print(f"Epoch {epoch+1}/{EPOCHS}")
+    print("=" * 70)
+
+    epoch_start = time.time()
+
+    model.train()
+
+    running_loss = 0.0
+
+    for batch_idx, (images, targets) in enumerate(train_loader):
+
+        images = images.to(DEVICE)
+
+        targets = targets.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        predictions = model(images)
+
+        loss = criterion(
+            predictions,
+            targets
         )
 
-        model.load_state_dict(
-            checkpoint["model_state_dict"]
-        )
+        loss.backward()
 
-        optimizer.load_state_dict(
-            checkpoint["optimizer_state_dict"]
-        )
+        optimizer.step()
 
-        scheduler.load_state_dict(
-            checkpoint["scheduler_state_dict"]
-        )
+        running_loss += loss.item()
 
-        if "scaler_state_dict" in checkpoint:
-            scaler.load_state_dict(
-                checkpoint["scaler_state_dict"]
+        if batch_idx % 100 == 0:
+
+            print(
+                f"Batch "
+                f"{batch_idx:4d}/{len(train_loader)}"
+                f" | Loss : {loss.item():.6f}"
             )
 
-        start_epoch = checkpoint["epoch"] + 1
-        best_loss = checkpoint["best_loss"]
+    train_loss = (
+        running_loss /
+        len(train_loader)
+    )
 
-        print(f"Resuming from Epoch : {start_epoch}")
-        print(f"Best Loss           : {best_loss:.6f}")
+    scheduler.step()
 
-    else:
+    print("\nTraining Loss :", train_loss)
+        # =====================================================
+    # Validation
+    # =====================================================
 
-        print("=" * 60)
-        print("No Previous Checkpoint Found")
-        print("Training From Scratch")
-        print("=" * 60)
+    model.eval()
 
-    # =========================================================
-    # Training Information
-    # =========================================================
+    validation_loss = 0.0
 
-    print("=" * 60)
-    print("Training Configuration")
-    print("=" * 60)
+    with torch.no_grad():
 
-    print("Epochs        :", cfg.POSE_EPOCHS)
-    print("Batch Size    :", cfg.BATCH_SIZE)
-    print("Learning Rate :", cfg.LEARNING_RATE)
-    print("Device        :", DEVICE)
+        for images, targets in val_loader:
 
-    print("=" * 60)
+            images = images.to(DEVICE)
+            targets = targets.to(DEVICE)
 
-    # =========================================================
-    # Start Training
-    # =========================================================
+            predictions = model(images)
 
-    try:
-        for epoch in range(start_epoch, cfg.POSE_EPOCHS):
-
-            model.train()
-            running_loss = 0.0
-            epoch_start = time.time()
-
-            progress_bar = tqdm(
-                train_loader,
-                desc=f"Epoch [{epoch+1}/{cfg.POSE_EPOCHS}]",
-                leave=True
+            loss = criterion(
+                predictions,
+                targets
             )
 
-            for images, targets in progress_bar:
-                images = images.to(DEVICE, non_blocking=True)
-                targets = targets.to(DEVICE, non_blocking=True)
+            validation_loss += loss.item()
 
-                optimizer.zero_grad(set_to_none=True)
+    validation_loss /= len(val_loader)
 
-                # Mixed Precision Forward Pass
-                with autocast(device_type=DEVICE.type, enabled=torch.cuda.is_available()):
-                    outputs = model(images)
-                    loss = criterion(outputs, targets)
+    print(
+        f"Validation Loss : {validation_loss:.6f}"
+    )
 
-                # Backward Pass
-                scaler.scale(loss).backward()
+    # =====================================================
+    # Save Best Model
+    # =====================================================
 
-                # Gradient Clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    if validation_loss < best_loss:
 
-                # Optimizer Step & Scaler Update
-                scaler.step(optimizer)
-                scaler.update()
+        best_loss = validation_loss
 
-                running_loss += loss.item()
-                progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+        best_path = os.path.join(
+            CHECKPOINT_DIR,
+            "best_model.pth"
+        )
 
-            # End of Epoch Metrics
-            epoch_loss = running_loss / len(train_loader)
-            epoch_time = time.time() - epoch_start
-            scheduler.step()
-
-            print(f"\nEpoch [{epoch+1}/{cfg.POSE_EPOCHS}] Completed in {epoch_time:.2f}s | Average Loss: {epoch_loss:.6f}")
-
-            # Save Last Checkpoint
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "best_loss": best_loss,
-            }, LAST_CHECKPOINT)
-
-            # Save Best Model
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                torch.save(model.state_dict(), BEST_MODEL)
-                print(f"--> Saved New Best Model! (Loss: {best_loss:.6f})")
-
-            print("-" * 60)
-
-    except KeyboardInterrupt:
-        print("\n" + "=" * 60)
-        print("Training Interrupted by User (Ctrl+C)")
-        print("Saving current checkpoint before exiting...")
-        print("=" * 60)
-        
         torch.save({
-            "epoch": epoch if 'epoch' in locals() else start_epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "best_loss": best_loss,
-        }, LAST_CHECKPOINT)
-        
-        print(f"Checkpoint saved successfully to: {LAST_CHECKPOINT}")
-        sys.exit(0)
 
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {str(e)}")
-        raise e
+            "epoch": epoch + 1,
+
+            "model_state_dict":
+                model.state_dict(),
+
+            "optimizer_state_dict":
+                optimizer.state_dict(),
+
+            "best_loss":
+                best_loss
+
+        }, best_path)
+
+        print("\nBest model updated!")
+
+    # =====================================================
+    # Save Epoch Checkpoint
+    # =====================================================
+
+    checkpoint_path = os.path.join(
+
+        CHECKPOINT_DIR,
+
+        f"vit_pose_epoch_{epoch+1}.pth"
+
+    )
+
+    torch.save({
+
+        "epoch": epoch + 1,
+
+        "model_state_dict":
+            model.state_dict(),
+
+        "optimizer_state_dict":
+            optimizer.state_dict(),
+
+        "train_loss":
+            train_loss,
+
+        "validation_loss":
+            validation_loss
+
+    }, checkpoint_path)
+
+    print(
+        f"Checkpoint Saved : {checkpoint_path}"
+    )
+
+    # =====================================================
+    # Epoch Summary
+    # =====================================================
+
+    epoch_time = time.time() - epoch_start
+
+    print("\n--------------------------------------")
+    print(f"Epoch {epoch+1} Completed")
+    print(f"Training Loss   : {train_loss:.6f}")
+    print(f"Validation Loss : {validation_loss:.6f}")
+    print(f"Best Loss       : {best_loss:.6f}")
+    print(f"Time            : {epoch_time/60:.2f} min")
+    print("--------------------------------------")
+
+
+# =====================================================
+# Training Finished
+# =====================================================
+
+print("\n")
+print("=" * 70)
+print("Training Completed Successfully!")
+print("=" * 70)
+
+print("\nBest Validation Loss :", best_loss)
+print("Best Model :", os.path.join(
+    CHECKPOINT_DIR,
+    "best_model.pth"
+))
