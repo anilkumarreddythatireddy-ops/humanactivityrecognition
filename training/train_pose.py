@@ -1,49 +1,25 @@
-from pathlib import Path
-from textwrap import dedent
-
-code = dedent(r'''
 """
 =========================================================
-ViT Pose Training - MPII
+Research-Oriented ViT Pose Training
+
+MPII Human Pose Estimation
+
+Author : Anil
 =========================================================
-
-Features
---------
-- MPII train/validation split
-- ViTPose model matching the current project architecture
-- MSE heatmap loss
-- PCK-style heatmap evaluation
-- Automatic resume from last_checkpoint.pth
-- Saves a checkpoint after EVERY epoch
-- Saves best_model.pth based on validation PCK
-- Saves best_loss_model.pth based on validation loss
-- CUDA / Kaggle GPU support
-- Mixed precision on CUDA
-- Gradient clipping
-- Fixed random split for reproducibility
-
-IMPORTANT
----------
-No training script can honestly guarantee 60-85% PCK/accuracy before
-the dataset, heatmap generation, coordinate scaling, model and metric
-are validated. This script is designed to improve and measure the model;
-the actual score depends on those components.
 """
 
 import os
 import sys
 import time
-import random
-
-import numpy as np
 import torch
 import torch.nn as nn
 
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
+from torch.utils.data import random_split
 
-# =========================================================
-# Project root
-# =========================================================
+# ---------------------------------------------------
+# Add project root
+# ---------------------------------------------------
 
 ROOT = os.path.dirname(
     os.path.dirname(
@@ -52,101 +28,55 @@ ROOT = os.path.dirname(
 )
 
 if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+    sys.path.append(ROOT)
 
-# =========================================================
-# Project imports
-# =========================================================
+# ---------------------------------------------------
+# Project Imports
+# ---------------------------------------------------
 
 from datasets.mpii_train_dataset import MPIITrainDataset
 from preprocessing.transforms import train_transform
 from models.vit_pose import ViTPose
 
-# =========================================================
+# ---------------------------------------------------
 # Configuration
-# =========================================================
+# ---------------------------------------------------
 
-IMAGE_DIR = os.path.join(
-    ROOT, "datasets", "mpii", "images"
-)
+IMAGE_DIR = "datasets/mpii/images"
 
-ANNOTATION_FILE = os.path.join(
-    ROOT,
-    "datasets",
-    "mpii",
-    "annotations",
+ANNOTATION_FILE = (
+    "datasets/mpii/annotations/"
     "mpii_human_pose_v1_u12_1.mat"
 )
 
-CHECKPOINT_DIR = os.path.join(
-    ROOT, "checkpoints"
-)
+CHECKPOINT_DIR = "checkpoints"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-# ---------------------------------------------------------
-# Training settings
-# ---------------------------------------------------------
 
 BATCH_SIZE = 16
 EPOCHS = 50
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+NUM_WORKERS = 2
+PCK_THRESHOLD = 5.0
 
 TRAIN_SPLIT = 0.80
 
-# PCK threshold in heatmap pixels.
-# 5/64 pixels is a reasonably strict threshold.
-PCK_THRESHOLD = 5.0
-
-# Set to 0 if Kaggle has worker issues.
-NUM_WORKERS = 2
-
-# =========================================================
-# Device
-# =========================================================
-
 DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
 )
 
 USE_AMP = DEVICE.type == "cuda"
 
-print("=" * 70)
-print("ViTPose MPII Training")
-print("=" * 70)
-print("Device       :", DEVICE)
-print("AMP          :", USE_AMP)
-print("Batch Size   :", BATCH_SIZE)
-print("Epochs       :", EPOCHS)
-print("Learning Rate:", LEARNING_RATE)
-print("=" * 70)
+print("=" * 60)
+print("Device :", DEVICE)
+print("=" * 60)
 
-if DEVICE.type == "cuda":
-    print("GPU          :", torch.cuda.get_device_name(0))
-    print("CUDA Memory  :",
-          round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2),
-          "GB")
-    print("=" * 70)
-
-# =========================================================
-# Reproducibility
-# =========================================================
-
-SEED = 42
-
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-# =========================================================
+# ---------------------------------------------------
 # Dataset
-# =========================================================
-
-print("\nLoading MPII dataset...")
+# ---------------------------------------------------
 
 dataset = MPIITrainDataset(
     image_dir=IMAGE_DIR,
@@ -160,30 +90,21 @@ train_size = int(
 
 val_size = len(dataset) - train_size
 
-split_generator = torch.Generator().manual_seed(SEED)
-
 train_dataset, val_dataset = random_split(
     dataset,
     [train_size, val_size],
-    generator=split_generator
+    generator=torch.Generator().manual_seed(42)
 )
 
-print("Total Samples     :", len(dataset))
-print("Training Samples  :", len(train_dataset))
-print("Validation Samples:", len(val_dataset))
-
-# =========================================================
-# Data loaders
-# =========================================================
-
-pin_memory = DEVICE.type == "cuda"
+print("Training Samples :", len(train_dataset))
+print("Validation Samples :", len(val_dataset))
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=NUM_WORKERS,
-    pin_memory=pin_memory,
+    pin_memory=(DEVICE.type == "cuda"),
     persistent_workers=(NUM_WORKERS > 0)
 )
 
@@ -192,30 +113,13 @@ val_loader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=False,
     num_workers=NUM_WORKERS,
-    pin_memory=pin_memory,
+    pin_memory=(DEVICE.type == "cuda"),
     persistent_workers=(NUM_WORKERS > 0)
 )
 
-print("Training batches  :", len(train_loader))
-print("Validation batches:", len(val_loader))
-
-# =========================================================
+# ---------------------------------------------------
 # Model
-# =========================================================
-#
-# This matches the smaller ViTPose architecture used by the
-# current train_pose.py:
-#
-# image_size = 256
-# patch_size = 16
-# embed_dim  = 256
-# depth      = 4
-# heads      = 8
-# joints     = 16
-#
-# Do NOT change these values if you want to resume a
-# checkpoint created with this architecture.
-# =========================================================
+# ---------------------------------------------------
 
 model = ViTPose(
     image_size=256,
@@ -226,17 +130,17 @@ model = ViTPose(
     num_joints=16
 ).to(DEVICE)
 
-print("\nModel created successfully.")
+print("\nModel Loaded Successfully\n")
 
-# =========================================================
+# ---------------------------------------------------
 # Loss
-# =========================================================
+# ---------------------------------------------------
 
 criterion = nn.MSELoss()
 
-# =========================================================
+# ---------------------------------------------------
 # Optimizer
-# =========================================================
+# ---------------------------------------------------
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
@@ -244,33 +148,25 @@ optimizer = torch.optim.AdamW(
     weight_decay=WEIGHT_DECAY
 )
 
-# =========================================================
-# Scheduler
-# =========================================================
-
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer,
-    T_max=EPOCHS,
-    eta_min=1e-6
+    T_max=EPOCHS
 )
 
-# =========================================================
-# AMP scaler
-# =========================================================
+best_loss = float("inf")
+start_epoch = 0
+# ---------------------------------------------------
+# Mixed Precision
+# ---------------------------------------------------
 
-try:
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=USE_AMP
-    )
-except (AttributeError, TypeError):
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=USE_AMP
-    )
+if USE_AMP:
+    scaler = torch.amp.GradScaler("cuda")
+else:
+    scaler = None
 
-# =========================================================
-# Checkpoint paths
-# =========================================================
+# =====================================================
+# Automatic Resume
+# =====================================================
 
 LAST_CHECKPOINT = os.path.join(
     CHECKPOINT_DIR,
@@ -287,27 +183,19 @@ BEST_LOSS_MODEL = os.path.join(
     "best_loss_model.pth"
 )
 
-# =========================================================
-# Resume state
-# =========================================================
-
-start_epoch = 0
+best_loss = float("inf")
 best_pck = 0.0
-best_val_loss = float("inf")
+start_epoch = 0
 
+if os.path.exists(LAST_CHECKPOINT):
 
-def load_checkpoint(path):
-    global start_epoch
-    global best_pck
-    global best_val_loss
-
-    print("\n" + "=" * 70)
-    print("Loading checkpoint")
-    print(path)
-    print("=" * 70)
+    print("=" * 60)
+    print("Loading last checkpoint...")
+    print(LAST_CHECKPOINT)
+    print("=" * 60)
 
     checkpoint = torch.load(
-        path,
+        LAST_CHECKPOINT,
         map_location=DEVICE
     )
 
@@ -325,123 +213,54 @@ def load_checkpoint(path):
             checkpoint["scheduler_state_dict"]
         )
 
-    if "scaler_state_dict" in checkpoint:
-        try:
-            scaler.load_state_dict(
-                checkpoint["scaler_state_dict"]
-            )
-        except Exception:
-            print("Warning: AMP scaler state could not be restored.")
-
-    # Checkpoints saved by this script store the completed
-    # epoch as epoch_number. Older project checkpoints used
-    # different conventions, so handle both.
-    if "epoch_number" in checkpoint:
-        completed_epoch = int(
-            checkpoint["epoch_number"]
+    start_epoch = int(
+        checkpoint.get(
+            "epoch_number",
+            checkpoint.get("epoch", 0)
         )
-        start_epoch = completed_epoch
+    )
 
-    elif "epoch" in checkpoint:
-        completed_epoch = int(
-            checkpoint["epoch"]
+    best_loss = float(
+        checkpoint.get(
+            "best_loss",
+            checkpoint.get("best_val_loss", float("inf"))
         )
-
-        # Existing project checkpoints store epoch+1.
-        # Treat it as the next epoch when it is within range.
-        start_epoch = completed_epoch
-
-    else:
-        start_epoch = 0
+    )
 
     best_pck = float(
-        checkpoint.get(
-            "best_pck",
-            0.0
-        )
+        checkpoint.get("best_pck", 0.0)
     )
 
-    best_val_loss = float(
-        checkpoint.get(
-            "best_val_loss",
-            checkpoint.get(
-                "best_loss",
-                float("inf")
-            )
-        )
-    )
-
-    print("Completed epoch :", start_epoch)
-    print("Next epoch      :", start_epoch + 1)
+    print("Completed Epoch :", start_epoch)
+    print("Next Epoch      :", start_epoch + 1)
+    print("Best Loss       :", best_loss)
     print("Best PCK        :", f"{best_pck:.2f}%")
-    print("Best Val Loss   :", f"{best_val_loss:.8f}")
-    print("=" * 70)
-
-
-# =========================================================
-# Automatically resume from last checkpoint
-# =========================================================
-
-if os.path.exists(LAST_CHECKPOINT):
-
-    load_checkpoint(
-        LAST_CHECKPOINT
-    )
 
 else:
 
-    print("\nNo last_checkpoint.pth found.")
-    print("Starting from epoch 1.")
+    print("No last checkpoint found.")
+    print("Starting from Epoch 1.")
 
-# =========================================================
-# Heatmap PCK
-# =========================================================
 
-def heatmap_pck(
-    predictions,
-    targets,
-    threshold=PCK_THRESHOLD
-):
-    """
-    PCK-style metric computed from heatmap argmax positions.
-
-    This is a heatmap-space diagnostic metric, not official
-    MPII PCKh. Official PCKh requires the original joint
-    coordinates and head-size normalization.
-
-    predictions: [B, J, H, W]
-    targets    : [B, J, H, W]
-    """
+def heatmap_pck(predictions, targets, threshold=PCK_THRESHOLD):
 
     with torch.no_grad():
 
-        pred_flat = predictions.detach().reshape(
-            predictions.shape[0],
-            predictions.shape[1],
-            -1
-        )
+        b, j, h, w = predictions.shape
 
-        target_flat = targets.detach().reshape(
-            targets.shape[0],
-            targets.shape[1],
-            -1
-        )
+        pred_index = predictions.reshape(
+            b, j, -1
+        ).argmax(dim=-1)
 
-        pred_indices = pred_flat.argmax(
-            dim=-1
-        )
+        target_index = targets.reshape(
+            b, j, -1
+        ).argmax(dim=-1)
 
-        target_indices = target_flat.argmax(
-            dim=-1
-        )
+        pred_x = pred_index % w
+        pred_y = pred_index // w
 
-        width = predictions.shape[-1]
-
-        pred_y = pred_indices // width
-        pred_x = pred_indices % width
-
-        target_y = target_indices // width
-        target_x = target_indices % width
+        target_x = target_index % w
+        target_y = target_index // w
 
         distance = torch.sqrt(
             (pred_x.float() - target_x.float()) ** 2
@@ -449,141 +268,72 @@ def heatmap_pck(
             (pred_y.float() - target_y.float()) ** 2
         )
 
-        correct = (
+        return (
             distance <= threshold
-        )
+        ).float().mean().item()
 
-        return correct.float().mean().item()
-
-
-# =========================================================
-# Save checkpoint
-# =========================================================
 
 def save_checkpoint(
-    completed_epoch,
+    epoch_number,
     train_loss,
-    val_loss,
-    val_pck
+    validation_loss,
+    validation_pck
 ):
-    checkpoint = {
-        "epoch_number": completed_epoch,
-        "epoch": completed_epoch,
 
-        "model_state_dict":
-            model.state_dict(),
-
-        "optimizer_state_dict":
-            optimizer.state_dict(),
-
-        "scheduler_state_dict":
-            scheduler.state_dict(),
-
-        "scaler_state_dict":
-            scaler.state_dict(),
-
-        "train_loss":
-            float(train_loss),
-
-        "validation_loss":
-            float(val_loss),
-
-        "val_pck":
-            float(val_pck),
-
-        "best_pck":
-            float(best_pck),
-
-        "best_val_loss":
-            float(best_val_loss)
+    state = {
+        "epoch": epoch_number,
+        "epoch_number": epoch_number,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "train_loss": float(train_loss),
+        "validation_loss": float(validation_loss),
+        "val_pck": float(validation_pck),
+        "best_loss": float(best_loss),
+        "best_pck": float(best_pck)
     }
 
-    # -----------------------------------------------------
-    # Latest resumable checkpoint
-    # -----------------------------------------------------
-
+    # Always overwrite this one so training can resume.
     torch.save(
-        checkpoint,
+        state,
         LAST_CHECKPOINT
     )
 
-    # -----------------------------------------------------
-    # Individual epoch checkpoint
-    # -----------------------------------------------------
-
+    # Keep a separate file for EVERY epoch.
     epoch_path = os.path.join(
         CHECKPOINT_DIR,
-        f"vit_pose_epoch_{completed_epoch}.pth"
+        f"vit_pose_epoch_{epoch_number}.pth"
     )
 
     torch.save(
-        checkpoint,
+        state,
         epoch_path
     )
 
-    return epoch_path
+    return state, epoch_path
 
 
-# =========================================================
-# AMP helper
-# =========================================================
-
-def autocast_context():
-    if USE_AMP:
-        try:
-            return torch.amp.autocast(
-                device_type="cuda",
-                enabled=True
-            )
-        except AttributeError:
-            return torch.cuda.amp.autocast(
-                enabled=True
-            )
-
-    return torch.autocast(
-        device_type="cpu",
-        enabled=False
-    )
-
-
-# =========================================================
-# Training
-# =========================================================
+# =====================================================
+# Training Loop
+# =====================================================
 
 try:
 
-    for epoch in range(
-        start_epoch,
-        EPOCHS
-    ):
-
-        epoch_number = epoch + 1
+    for epoch in range(start_epoch, EPOCHS):
 
         print("\n")
         print("=" * 70)
-        print(
-            f"Epoch {epoch_number}/{EPOCHS}"
-        )
+        print(f"Epoch {epoch + 1}/{EPOCHS}")
         print("=" * 70)
 
         epoch_start = time.time()
-
-        # -------------------------------------------------
-        # Training
-        # -------------------------------------------------
 
         model.train()
 
         running_loss = 0.0
         running_pck = 0.0
 
-        for batch_idx, batch in enumerate(
-            train_loader
-        ):
-
-            # Dataset is expected to return:
-            # image, heatmap
-            images, targets = batch
+        for batch_idx, (images, targets) in enumerate(train_loader):
 
             images = images.to(
                 DEVICE,
@@ -599,47 +349,42 @@ try:
                 set_to_none=True
             )
 
-            # -------------------------------------------------
-            # Forward
-            # -------------------------------------------------
-
-            with autocast_context():
-
-                predictions = model(
-                    images
-                )
-
-                loss = criterion(
-                    predictions,
-                    targets
-                )
-
-            # -------------------------------------------------
-            # Backward
-            # -------------------------------------------------
-
             if USE_AMP:
 
-                scaler.scale(
-                    loss
-                ).backward()
+                with torch.amp.autocast(
+                    device_type="cuda"
+                ):
 
-                scaler.unscale_(
-                    optimizer
-                )
+                    predictions = model(images)
+
+                    loss = criterion(
+                        predictions,
+                        targets
+                    )
+
+                if "scaler" not in globals():
+                    scaler = torch.amp.GradScaler("cuda")
+
+                scaler.scale(loss).backward()
+
+                scaler.unscale_(optimizer)
 
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     max_norm=1.0
                 )
 
-                scaler.step(
-                    optimizer
-                )
-
+                scaler.step(optimizer)
                 scaler.update()
 
             else:
+
+                predictions = model(images)
+
+                loss = criterion(
+                    predictions,
+                    targets
+                )
 
                 loss.backward()
 
@@ -650,44 +395,18 @@ try:
 
                 optimizer.step()
 
-            # -------------------------------------------------
-            # Metrics
-            # -------------------------------------------------
+            running_loss += loss.item()
 
-            batch_loss = loss.item()
-
-            batch_pck = heatmap_pck(
+            running_pck += heatmap_pck(
                 predictions,
                 targets
             )
 
-            running_loss += batch_loss
-            running_pck += batch_pck
-
-            # -------------------------------------------------
-            # Logging
-            # -------------------------------------------------
-
-            if (
-                batch_idx % 50 == 0
-                or batch_idx == len(train_loader) - 1
-            ):
-
-                current_loss = (
-                    running_loss /
-                    (batch_idx + 1)
-                )
-
-                current_pck = (
-                    running_pck /
-                    (batch_idx + 1)
-                ) * 100.0
+            if batch_idx % 100 == 0:
 
                 print(
-                    f"Epoch [{epoch_number}/{EPOCHS}] "
-                    f"Batch [{batch_idx+1}/{len(train_loader)}] "
-                    f"Loss: {current_loss:.6f} "
-                    f"PCK: {current_pck:.2f}%"
+                    f"Batch {batch_idx:5d}/{len(train_loader)}"
+                    f" | Loss: {loss.item():.6f}"
                 )
 
         train_loss = (
@@ -696,9 +415,12 @@ try:
         )
 
         train_pck = (
+            100.0 *
             running_pck /
             max(1, len(train_loader))
-        ) * 100.0
+        )
+
+        scheduler.step()
 
         # -------------------------------------------------
         # Validation
@@ -723,11 +445,22 @@ try:
                     non_blocking=True
                 )
 
-                with autocast_context():
+                if USE_AMP:
 
-                    predictions = model(
-                        images
-                    )
+                    with torch.amp.autocast(
+                        device_type="cuda"
+                    ):
+
+                        predictions = model(images)
+
+                        loss = criterion(
+                            predictions,
+                            targets
+                        )
+
+                else:
+
+                    predictions = model(images)
 
                     loss = criterion(
                         predictions,
@@ -747,273 +480,98 @@ try:
         )
 
         validation_pck = (
+            100.0 *
             validation_pck /
             max(1, len(val_loader))
-        ) * 100.0
+        )
 
-        # -------------------------------------------------
-        # Scheduler
-        # -------------------------------------------------
+        is_best_loss = (
+            validation_loss < best_loss
+        )
 
-        scheduler.step()
-
-        # -------------------------------------------------
-        # Best values
-        # -------------------------------------------------
-
-        new_best_pck = (
+        is_best_pck = (
             validation_pck > best_pck
         )
 
-        new_best_loss = (
-            validation_loss < best_val_loss
-        )
+        if is_best_loss:
+            best_loss = validation_loss
 
-        if new_best_pck:
+        if is_best_pck:
             best_pck = validation_pck
 
-        if new_best_loss:
-            best_val_loss = validation_loss
-
         # -------------------------------------------------
-        # Save EVERY epoch
+        # Save every epoch
         # -------------------------------------------------
 
-        epoch_path = save_checkpoint(
-            completed_epoch=epoch_number,
-            train_loss=train_loss,
-            val_loss=validation_loss,
-            val_pck=validation_pck
+        state, checkpoint_path = save_checkpoint(
+            epoch + 1,
+            train_loss,
+            validation_loss,
+            validation_pck
         )
 
         # -------------------------------------------------
-        # Save best PCK model
+        # Save best models
         # -------------------------------------------------
 
-        if new_best_pck:
-
-            best_checkpoint = {
-                "epoch_number":
-                    epoch_number,
-
-                "epoch":
-                    epoch_number,
-
-                "model_state_dict":
-                    model.state_dict(),
-
-                "optimizer_state_dict":
-                    optimizer.state_dict(),
-
-                "scheduler_state_dict":
-                    scheduler.state_dict(),
-
-                "scaler_state_dict":
-                    scaler.state_dict(),
-
-                "train_loss":
-                    float(train_loss),
-
-                "validation_loss":
-                    float(validation_loss),
-
-                "val_pck":
-                    float(validation_pck),
-
-                "best_pck":
-                    float(best_pck),
-
-                "best_val_loss":
-                    float(best_val_loss)
-            }
+        if is_best_loss:
 
             torch.save(
-                best_checkpoint,
-                BEST_MODEL
-            )
-
-        # -------------------------------------------------
-        # Save best loss model
-        # -------------------------------------------------
-
-        if new_best_loss:
-
-            loss_checkpoint = {
-                "epoch_number":
-                    epoch_number,
-
-                "epoch":
-                    epoch_number,
-
-                "model_state_dict":
-                    model.state_dict(),
-
-                "optimizer_state_dict":
-                    optimizer.state_dict(),
-
-                "scheduler_state_dict":
-                    scheduler.state_dict(),
-
-                "scaler_state_dict":
-                    scaler.state_dict(),
-
-                "train_loss":
-                    float(train_loss),
-
-                "validation_loss":
-                    float(validation_loss),
-
-                "val_pck":
-                    float(validation_pck),
-
-                "best_pck":
-                    float(best_pck),
-
-                "best_val_loss":
-                    float(best_val_loss)
-            }
-
-            torch.save(
-                loss_checkpoint,
+                state,
                 BEST_LOSS_MODEL
             )
 
-        # -------------------------------------------------
-        # Summary
-        # -------------------------------------------------
+            print("Best loss model updated!")
+
+        if is_best_pck:
+
+            torch.save(
+                state,
+                BEST_MODEL
+            )
+
+            print("Best PCK model updated!")
 
         epoch_time = (
-            time.time() -
-            epoch_start
+            time.time() - epoch_start
         )
 
-        print("\n" + "-" * 70)
-        print(
-            f"Epoch {epoch_number} Completed"
-        )
-        print(
-            f"Training Loss   : {train_loss:.6f}"
-        )
-        print(
-            f"Training PCK    : {train_pck:.2f}%"
-        )
-        print(
-            f"Validation Loss : {validation_loss:.6f}"
-        )
-        print(
-            f"Validation PCK  : {validation_pck:.2f}%"
-        )
-        print(
-            f"Best PCK        : {best_pck:.2f}%"
-        )
-        print(
-            f"Best Val Loss   : {best_val_loss:.6f}"
-        )
+        print("\n--------------------------------------")
+        print(f"Epoch {epoch + 1} Completed")
+        print(f"Training Loss   : {train_loss:.6f}")
+        print(f"Training PCK    : {train_pck:.2f}%")
+        print(f"Validation Loss : {validation_loss:.6f}")
+        print(f"Validation PCK  : {validation_pck:.2f}%")
+        print(f"Best Loss       : {best_loss:.6f}")
+        print(f"Best PCK        : {best_pck:.2f}%")
         print(
             f"Learning Rate   : "
             f"{optimizer.param_groups[0]['lr']:.8f}"
         )
-        print(
-            f"Epoch Time      : "
-            f"{epoch_time / 60:.2f} min"
-        )
-        print(
-            f"Saved Checkpoint: {epoch_path}"
-        )
-        print("-" * 70)
-
-        # -------------------------------------------------
-        # Reset CUDA peak memory counter
-        # -------------------------------------------------
-
-        if DEVICE.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
+        print(f"Time            : {epoch_time / 60:.2f} min")
+        print(f"Checkpoint Saved: {checkpoint_path}")
+        print("--------------------------------------")
 
 except KeyboardInterrupt:
 
-    print("\n")
-    print("=" * 70)
-    print("TRAINING INTERRUPTED")
-    print("=" * 70)
-
-    # Save current state so the user can resume.
-    interrupted_checkpoint = {
-        "epoch_number":
-            max(0, epoch),
-
-        "epoch":
-            max(0, epoch),
-
-        "model_state_dict":
-            model.state_dict(),
-
-        "optimizer_state_dict":
-            optimizer.state_dict(),
-
-        "scheduler_state_dict":
-            scheduler.state_dict(),
-
-        "scaler_state_dict":
-            scaler.state_dict(),
-
-        "best_pck":
-            float(best_pck),
-
-        "best_val_loss":
-            float(best_val_loss)
-    }
-
-    torch.save(
-        interrupted_checkpoint,
-        LAST_CHECKPOINT
-    )
-
-    print(
-        "Emergency checkpoint saved:"
-    )
-    print(
-        LAST_CHECKPOINT
-    )
-
-    print(
-        "\nRun the same command again to resume:"
-    )
-    print(
-        "python -m training.train_pose"
-    )
-
+    print("\nTraining interrupted.")
+    print("The last completed epoch is saved.")
+    print("Run the same command again to resume:")
+    print("python -m training.train_pose")
     raise
 
-# =========================================================
-# Finished
-# =========================================================
+
+# =====================================================
+# Training Finished
+# =====================================================
 
 print("\n")
 print("=" * 70)
-print("TRAINING COMPLETED")
+print("Training Completed Successfully!")
 print("=" * 70)
 
-print(
-    f"Best Validation PCK : {best_pck:.2f}%"
-)
-
-print(
-    f"Best Validation Loss: {best_val_loss:.6f}"
-)
-
-print(
-    "Best Model          :",
-    BEST_MODEL
-)
-
-print(
-    "Last Checkpoint     :",
-    LAST_CHECKPOINT
-)
-
-print("=" * 70)
-''')
-
-path = "/mnt/data/train_pose.py"
-Path(path).write_text(code, encoding="utf-8")
-print(path)
+print("\nBest Validation Loss :", best_loss)
+print("Best Model :", os.path.join(
+    CHECKPOINT_DIR,
+    "best_model.pth"
+))
