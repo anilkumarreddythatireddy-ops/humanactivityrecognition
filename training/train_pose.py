@@ -122,11 +122,6 @@ val_loader = DataLoader(
 # ---------------------------------------------------
 
 model = ViTPose(
-    image_size=256,
-    patch_size=16,
-    embed_dim=256,
-    depth=4,
-    num_heads=8,
     num_joints=16
 ).to(DEVICE)
 
