@@ -1,5 +1,0 @@
-venv/
-datasets/
-checkpoints/
-__pycache__/
-*.pyc
