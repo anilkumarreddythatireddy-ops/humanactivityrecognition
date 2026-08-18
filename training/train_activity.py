@@ -869,4 +869,836 @@ if os.path.exists(
     print(
         "Best Val Accuracy :",
         f"{BEST_VAL_ACC:.2f}%"
-   
+    )
+
+else:
+
+    print("\nNo previous Experiment-2 checkpoint.")
+    print("Starting from Epoch 1.")
+
+
+# ============================================================
+# KL WEIGHT
+# ============================================================
+
+def get_kl_weight(epoch):
+
+    if KL_WARMUP_EPOCHS <= 0:
+
+        return MAX_KL_WEIGHT
+
+    progress = min(
+        epoch / KL_WARMUP_EPOCHS,
+        1.0
+    )
+
+    return (
+        MAX_KL_WEIGHT *
+        progress
+    )
+
+
+# ============================================================
+# KL LOSS
+# ============================================================
+
+def kl_loss(
+    mu,
+    logvar
+):
+
+    value = -0.5 * torch.sum(
+        1 +
+        logvar -
+        mu.pow(2) -
+        logvar.exp(),
+        dim=1
+    )
+
+    return value.mean()
+
+
+# ============================================================
+# TOP-K ACCURACY
+# ============================================================
+
+def topk_accuracy(
+    logits,
+    targets,
+    k=1
+):
+
+    with torch.no_grad():
+
+        max_k = min(
+            k,
+            logits.size(1)
+        )
+
+        _, pred = logits.topk(
+            max_k,
+            dim=1
+        )
+
+        correct = (
+            pred ==
+            targets.unsqueeze(1)
+        )
+
+        correct = correct.any(
+            dim=1
+        )
+
+        return (
+            correct.float().sum().item()
+        )
+
+
+# ============================================================
+# TRAIN ONE EPOCH
+# ============================================================
+
+def train_one_epoch(
+    epoch
+):
+
+    model.train()
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_recon = 0.0
+    total_kl = 0.0
+
+    correct_top1 = 0
+    correct_top5 = 0
+    total_samples = 0
+
+    kl_weight = get_kl_weight(
+        epoch
+    )
+
+    start_time = time.time()
+
+    for batch_idx, (
+        x,
+        y
+    ) in enumerate(train_loader):
+
+        x = x.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        y = y.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        with autocast(
+            enabled=USE_AMP
+        ):
+
+            (
+                logits,
+                reconstruction,
+                mu,
+                logvar
+            ) = model(x)
+
+            ce = criterion(
+                logits,
+                y
+            )
+
+            recon = F.mse_loss(
+                reconstruction,
+                x
+            )
+
+            kl = kl_loss(
+                mu,
+                logvar
+            )
+
+            loss = (
+                CLASSIFICATION_WEIGHT * ce
+                +
+                RECONSTRUCTION_WEIGHT * recon
+                +
+                kl_weight * kl
+            )
+
+        scaler.scale(
+            loss
+        ).backward()
+
+        scaler.unscale_(
+            optimizer
+        )
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
+        scaler.step(
+            optimizer
+        )
+
+        scaler.update()
+
+        batch_size = x.size(0)
+
+        total_samples += batch_size
+
+        total_loss += (
+            loss.item() *
+            batch_size
+        )
+
+        total_ce += (
+            ce.item() *
+            batch_size
+        )
+
+        total_recon += (
+            recon.item() *
+            batch_size
+        )
+
+        total_kl += (
+            kl.item() *
+            batch_size
+        )
+
+        correct_top1 += topk_accuracy(
+            logits,
+            y,
+            1
+        )
+
+        correct_top5 += topk_accuracy(
+            logits,
+            y,
+            5
+        )
+
+        if (
+            batch_idx % 50 == 0
+            or
+            batch_idx == len(train_loader) - 1
+        ):
+
+            running_acc = (
+                100.0 *
+                correct_top1 /
+                total_samples
+            )
+
+            print(
+                f"Epoch {epoch:03d} | "
+                f"Batch {batch_idx:04d}/"
+                f"{len(train_loader)-1:04d} | "
+                f"Loss {loss.item():.4f} | "
+                f"Top1 {running_acc:.2f}%"
+            )
+
+    return {
+        "loss":
+            total_loss /
+            total_samples,
+
+        "ce":
+            total_ce /
+            total_samples,
+
+        "recon":
+            total_recon /
+            total_samples,
+
+        "kl":
+            total_kl /
+            total_samples,
+
+        "top1":
+            100.0 *
+            correct_top1 /
+            total_samples,
+
+        "top5":
+            100.0 *
+            correct_top5 /
+            total_samples,
+
+        "kl_weight":
+            kl_weight,
+
+        "time":
+            time.time() -
+            start_time
+    }
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+@torch.no_grad()
+def evaluate(
+    loader
+):
+
+    model.eval()
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_recon = 0.0
+    total_kl = 0.0
+
+    correct_top1 = 0
+    correct_top5 = 0
+
+    total_samples = 0
+
+    for x, y in loader:
+
+        x = x.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        y = y.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        with autocast(
+            enabled=USE_AMP
+        ):
+
+            (
+                logits,
+                reconstruction,
+                mu,
+                logvar
+            ) = model(x)
+
+            ce = criterion(
+                logits,
+                y
+            )
+
+            recon = F.mse_loss(
+                reconstruction,
+                x
+            )
+
+            kl = kl_loss(
+                mu,
+                logvar
+            )
+
+            # During evaluation use
+            # final KL weight.
+            loss = (
+                CLASSIFICATION_WEIGHT * ce
+                +
+                RECONSTRUCTION_WEIGHT * recon
+                +
+                MAX_KL_WEIGHT * kl
+            )
+
+        batch_size = x.size(0)
+
+        total_samples += batch_size
+
+        total_loss += (
+            loss.item() *
+            batch_size
+        )
+
+        total_ce += (
+            ce.item() *
+            batch_size
+        )
+
+        total_recon += (
+            recon.item() *
+            batch_size
+        )
+
+        total_kl += (
+            kl.item() *
+            batch_size
+        )
+
+        correct_top1 += topk_accuracy(
+            logits,
+            y,
+            1
+        )
+
+        correct_top5 += topk_accuracy(
+            logits,
+            y,
+            5
+        )
+
+    return {
+        "loss":
+            total_loss /
+            total_samples,
+
+        "ce":
+            total_ce /
+            total_samples,
+
+        "recon":
+            total_recon /
+            total_samples,
+
+        "kl":
+            total_kl /
+            total_samples,
+
+        "top1":
+            100.0 *
+            correct_top1 /
+            total_samples,
+
+        "top5":
+            100.0 *
+            correct_top5 /
+            total_samples
+    }
+
+
+# ============================================================
+# TRAINING LOOP
+# ============================================================
+
+print("\n" + "=" * 70)
+print("STARTING EXPERIMENT 2")
+print("=" * 70)
+
+print(
+    "\nCheckpoint directory:",
+    CHECKPOINT_DIR
+)
+
+for epoch in range(
+    START_EPOCH,
+    NUM_EPOCHS + 1
+):
+
+    epoch_start = time.time()
+
+    print("\n")
+    print("=" * 70)
+    print(
+        f"EPOCH {epoch}/{NUM_EPOCHS}"
+    )
+    print("=" * 70)
+
+    train_metrics = train_one_epoch(
+        epoch
+    )
+
+    val_metrics = evaluate(
+        val_loader
+    )
+
+    scheduler.step()
+
+    current_lr = optimizer.param_groups[
+        0
+    ]["lr"]
+
+    print("\n" + "-" * 70)
+
+    print(
+        f"Epoch {epoch} Completed"
+    )
+
+    print(
+        f"Training Loss       : "
+        f"{train_metrics['loss']:.6f}"
+    )
+
+    print(
+        f"Training Top-1      : "
+        f"{train_metrics['top1']:.2f}%"
+    )
+
+    print(
+        f"Training Top-5      : "
+        f"{train_metrics['top5']:.2f}%"
+    )
+
+    print(
+        f"Validation Loss     : "
+        f"{val_metrics['loss']:.6f}"
+    )
+
+    print(
+        f"Validation Top-1    : "
+        f"{val_metrics['top1']:.2f}%"
+    )
+
+    print(
+        f"Validation Top-5    : "
+        f"{val_metrics['top5']:.2f}%"
+    )
+
+    print(
+        f"CE Loss             : "
+        f"{val_metrics['ce']:.6f}"
+    )
+
+    print(
+        f"Reconstruction Loss : "
+        f"{val_metrics['recon']:.6f}"
+    )
+
+    print(
+        f"KL Loss             : "
+        f"{val_metrics['kl']:.6f}"
+    )
+
+    print(
+        f"KL Weight           : "
+        f"{train_metrics['kl_weight']:.6f}"
+    )
+
+    print(
+        f"Learning Rate       : "
+        f"{current_lr:.8f}"
+    )
+
+    print(
+        f"Time                : "
+        f"{time.time()-epoch_start:.2f} sec"
+    )
+
+    # --------------------------------------------------------
+    # Save every epoch
+    # --------------------------------------------------------
+
+    epoch_checkpoint = os.path.join(
+        CHECKPOINT_DIR,
+        f"epoch_{epoch:03d}.pth"
+    )
+
+    torch.save(
+        {
+            "epoch":
+                epoch,
+
+            "model_state_dict":
+                model.state_dict(),
+
+            "optimizer_state_dict":
+                optimizer.state_dict(),
+
+            "scheduler_state_dict":
+                scheduler.state_dict(),
+
+            "scaler_state_dict":
+                scaler.state_dict(),
+
+            "best_val_acc":
+                BEST_VAL_ACC,
+
+            "best_val_loss":
+                BEST_VAL_LOSS,
+
+            "train_metrics":
+                train_metrics,
+
+            "val_metrics":
+                val_metrics,
+
+            "classes":
+                classes,
+
+            "config":
+                {
+                    "sequence_length":
+                        SEQUENCE_LENGTH,
+
+                    "num_joints":
+                        NUM_JOINTS,
+
+                    "coordinates":
+                        COORDINATES,
+
+                    "d_model":
+                        D_MODEL,
+
+                    "nhead":
+                        NHEAD,
+
+                    "num_layers":
+                        NUM_LAYERS,
+
+                    "latent_dim":
+                        LATENT_DIM
+                }
+        },
+        epoch_checkpoint
+    )
+
+    # --------------------------------------------------------
+    # Best model
+    # --------------------------------------------------------
+
+    improved = False
+
+    if (
+        val_metrics["top1"]
+        >
+        BEST_VAL_ACC
+    ):
+
+        BEST_VAL_ACC = (
+            val_metrics["top1"]
+        )
+
+        improved = True
+
+    if (
+        val_metrics["loss"]
+        <
+        BEST_VAL_LOSS
+    ):
+
+        BEST_VAL_LOSS = (
+            val_metrics["loss"]
+        )
+
+    if improved:
+
+        torch.save(
+            {
+                "epoch":
+                    epoch,
+
+                "model_state_dict":
+                    model.state_dict(),
+
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+
+                "scheduler_state_dict":
+                    scheduler.state_dict(),
+
+                "scaler_state_dict":
+                    scaler.state_dict(),
+
+                "best_val_acc":
+                    BEST_VAL_ACC,
+
+                "best_val_loss":
+                    BEST_VAL_LOSS,
+
+                "val_metrics":
+                    val_metrics,
+
+                "classes":
+                    classes
+            },
+            BEST_MODEL
+        )
+
+        print(
+            "\n✓ BEST MODEL UPDATED"
+        )
+
+        print(
+            "Best Validation Top-1 :",
+            f"{BEST_VAL_ACC:.2f}%"
+        )
+
+    # --------------------------------------------------------
+    # Last checkpoint
+    # --------------------------------------------------------
+
+    torch.save(
+        {
+            "epoch":
+                epoch,
+
+            "model_state_dict":
+                model.state_dict(),
+
+            "optimizer_state_dict":
+                optimizer.state_dict(),
+
+            "scheduler_state_dict":
+                scheduler.state_dict(),
+
+            "scaler_state_dict":
+                scaler.state_dict(),
+
+            "best_val_acc":
+                BEST_VAL_ACC,
+
+            "best_val_loss":
+                BEST_VAL_LOSS,
+
+            "train_metrics":
+                train_metrics,
+
+            "val_metrics":
+                val_metrics,
+
+            "classes":
+                classes
+        },
+        LAST_CHECKPOINT
+    )
+
+    print(
+        "\nCheckpoint Saved:",
+        epoch_checkpoint
+    )
+
+
+# ============================================================
+# FINAL TEST
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("TRAINING COMPLETED")
+print("=" * 70)
+
+print(
+    f"\nBest Validation Accuracy : "
+    f"{BEST_VAL_ACC:.2f}%"
+)
+
+print(
+    "Best Model :",
+    BEST_MODEL
+)
+
+
+print("\n")
+print("=" * 70)
+print("LOADING BEST MODEL FOR TEST")
+print("=" * 70)
+
+if not os.path.exists(
+    BEST_MODEL
+):
+
+    raise FileNotFoundError(
+        "Best model was not created."
+    )
+
+best_checkpoint = torch.load(
+    BEST_MODEL,
+    map_location=DEVICE
+)
+
+model.load_state_dict(
+    best_checkpoint[
+        "model_state_dict"
+    ]
+)
+
+print(
+    "Best checkpoint epoch :",
+    best_checkpoint.get(
+        "epoch",
+        "unknown"
+    )
+)
+
+print(
+    "Best validation accuracy :",
+    f"{best_checkpoint.get('best_val_acc', 0.0):.2f}%"
+)
+
+
+test_metrics = evaluate(
+    test_loader
+)
+
+
+# ============================================================
+# FINAL RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("FINAL TEST RESULTS - EXPERIMENT 2")
+print("=" * 70)
+
+print(
+    f"\nTest Loss       : "
+    f"{test_metrics['loss']:.6f}"
+)
+
+print(
+    f"Test Top-1      : "
+    f"{test_metrics['top1']:.2f}%"
+)
+
+print(
+    f"Test Top-5      : "
+    f"{test_metrics['top5']:.2f}%"
+)
+
+print(
+    f"Test CE Loss    : "
+    f"{test_metrics['ce']:.6f}"
+)
+
+print(
+    f"Test Recon Loss : "
+    f"{test_metrics['recon']:.6f}"
+)
+
+print(
+    f"Test KL Loss    : "
+    f"{test_metrics['kl']:.6f}"
+)
+
+
+# ============================================================
+# COMPARISON WITH EXPERIMENT 1
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("EXPERIMENT COMPARISON")
+print("=" * 70)
+
+print(
+    "\nExperiment 1 Test Accuracy : 14.88%"
+)
+
+print(
+    f"Experiment 2 Test Accuracy : "
+    f"{test_metrics['top1']:.2f}%"
+)
+
+improvement = (
+    test_metrics["top1"]
+    - 14.88
+)
+
+print(
+    f"Absolute Improvement       : "
+    f"{improvement:+.2f} percentage points"
+)
+
+print("\n" + "=" * 70)
+print("STAGE 4 EXPERIMENT 2 COMPLETED")
+print("=" * 70)
